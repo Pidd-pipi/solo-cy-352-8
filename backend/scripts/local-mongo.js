@@ -1,4 +1,5 @@
-/* 本地功能检查用：启动一个数据落盘的 MongoDB（固定 dbPath，重启后数据仍在）。
+/* 本地功能检查用：启动一个数据落盘的 MongoDB 单节点副本集
+   （固定 dbPath，重启后数据仍在；副本集模式是后端事务的前提）。
    生产环境仍使用 docker-compose 中的 mongo 服务，此脚本不参与部署。
    本机为 aarch64 Debian，MongoDB 官方未提供 debian12/arm 包，
    使用 ubuntu2204 构建（glibc 兼容）。
@@ -8,7 +9,7 @@ process.env.MONGOMS_DISTRO = process.env.MONGOMS_DISTRO || "ubuntu-22.04";
 
 const fs = require("fs");
 const path = require("path");
-const { MongoMemoryServer } = require("mongodb-memory-server");
+const { MongoMemoryReplSet } = require("mongodb-memory-server");
 
 const PORT = Number(process.env.MONGO_PORT || 27017);
 const DB_PATH = process.env.MONGO_DB_PATH
@@ -18,18 +19,18 @@ const DB_PATH = process.env.MONGO_DB_PATH
 async function main() {
   fs.mkdirSync(DB_PATH, { recursive: true });
 
-  const server = await MongoMemoryServer.create({
+  const server = await MongoMemoryReplSet.create({
     binary: { version: "7.0.14" },
-    instance: {
-      port: PORT,
-      // 固定端口：端口被占用时直接报错，而不是静默改用随机端口（后端会连不上）
-      portGeneration: false,
+    replSet: {
+      count: 1,
+      name: "rs0",
       dbName: "app",
       storageEngine: "wiredTiger",
-      dbPath: DB_PATH,
     },
+    // 固定端口与数据目录只能通过 instanceOpts 指定（replSet 层级的 port/dbPath 会被忽略）
+    instanceOpts: [{ port: PORT, dbPath: DB_PATH, storageEngine: "wiredTiger" }],
   });
-  console.log(`MONGO_READY ${server.getUri()} (dbPath: ${DB_PATH})`);
+  console.log(`MONGO_READY ${server.getUri()} (dbPath: ${DB_PATH}, replSet rs0)`);
   process.on("SIGTERM", async () => {
     await server.stop();
     process.exit(0);

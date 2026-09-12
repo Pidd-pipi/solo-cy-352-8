@@ -4,10 +4,11 @@
  *   node scripts/business-rules.test.js   （或 npm test）
  *
  * 套件自包含：自动构建后端、在独立数据目录（.mongo-test-data，每轮开始时清空）
- * 启动专用 MongoDB（27018）与后端（29513），执行规则用例，随后分别重启
- * 后端与数据服务验证记录仍在，最后清理进程并汇总。
+ * 启动专用 MongoDB 单节点副本集（27018，事务前提）与后端（29513），执行规则
+ * 用例，随后分别重启后端与数据服务验证记录仍在，并通过故障注入验证下单/
+ * 取消/充值的原子性，最后清理进程并汇总。
  *
- * 每条用例归属一条业务规则（R1~R13）；任何断言失败都会在结尾明确指出
+ * 每条用例归属一条业务规则（R1~R14）；任何断言失败都会在结尾明确指出
  * 被破坏的规则编号与内容，并以非零码退出。
  */
 process.env.MONGOMS_DISTRO = process.env.MONGOMS_DISTRO || "ubuntu-22.04";
@@ -15,7 +16,6 @@ process.env.MONGOMS_DISTRO = process.env.MONGOMS_DISTRO || "ubuntu-22.04";
 const { execSync, spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const { MongoMemoryServer } = require("mongodb-memory-server");
 
 const BACKEND_DIR = path.resolve(__dirname, "..");
 const TEST_DB_PATH = path.resolve(BACKEND_DIR, "../.mongo-test-data");
@@ -39,6 +39,7 @@ const RULES = {
   R11: "维护中的包厢不可预约",
   R12: "充值/消费/退款均写入流水，记录余额与积分变动快照",
   R13: "后端重启、数据服务重启后，会员/预约/流水记录完整可查",
+  R14: "下单/取消/充值的原子性：扣款、预约、流水全部成功或全部不生效",
 };
 
 let currentRule = "R0";
@@ -92,13 +93,16 @@ let mongo = null;
 let backend = null;
 
 async function startMongo() {
-  // portGeneration:false —— 固定端口；默认行为下 MMS 会把本进程已用过的端口视为
-  // “被锁定”而改发随机端口，导致重启后后端连不上原端口（曾因此误判为不重连）。
-  mongo = await MongoMemoryServerClass.create({
+  // 单节点副本集：多文档事务的前提。固定端口与 dbPath 必须放在 instanceOpts
+  // （replSet 层级的 port/dbPath 会被静默忽略）；resetPortsCache 避免同进程
+  // 重启时端口被 MMS 内部缓存误判为“已锁定”而改发随机端口。
+  resetPortsCache();
+  mongo = await MongoMemoryReplSetClass.create({
     binary: { version: "7.0.14" },
-    instance: { port: MONGO_PORT, portGeneration: false, dbName: "apptest", storageEngine: "wiredTiger", dbPath: TEST_DB_PATH },
+    replSet: { count: 1, name: "rs0", dbName: "apptest", storageEngine: "wiredTiger" },
+    instanceOpts: [{ port: MONGO_PORT, dbPath: TEST_DB_PATH, storageEngine: "wiredTiger" }],
   });
-  console.log(`  [环境] MongoDB 已启动 :${MONGO_PORT}（dbPath ${TEST_DB_PATH}）`);
+  console.log(`  [环境] MongoDB 副本集已启动 :${MONGO_PORT}（dbPath ${TEST_DB_PATH}）`);
 }
 
 async function stopMongo() {
@@ -109,10 +113,15 @@ async function stopMongo() {
   }
 }
 
-async function startBackend() {
+async function startBackend(extraEnv = {}) {
   backend = spawn("node", ["dist/index.js"], {
     cwd: BACKEND_DIR,
-    env: { ...process.env, DATABASE_URL: `mongodb://127.0.0.1:${MONGO_PORT}/apptest`, PORT: String(API_PORT) },
+    env: {
+      ...process.env,
+      DATABASE_URL: `mongodb://127.0.0.1:${MONGO_PORT}/apptest`,
+      PORT: String(API_PORT),
+      ...extraEnv,
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   backend.stdout.on("data", (chunk) => process.stdout.write(`  [后端] ${chunk}`));
@@ -120,7 +129,8 @@ async function startBackend() {
   backend.on("error", (error) => console.log(`  [后端!] 启动失败 ${error.message}`));
   const healthy = await waitFor(async () => {
     try {
-      const res = await fetch(`http://localhost:${API_PORT}/health`);
+      // /api/rooms 经过数据库守卫，200 才表示进程与数据库连接均已就绪
+      const res = await fetch(`${BASE}/rooms`);
       return res.ok;
     } catch {
       return false;
@@ -364,7 +374,8 @@ async function verifyStateUnchanged(snapshot, memberIds, stage) {
 
 /* ---------------- 主流程 ---------------- */
 
-let MongoMemoryServerClass;
+let MongoMemoryReplSetClass;
+let resetPortsCache = () => {};
 
 async function main() {
   console.log("构建后端（确保测试的是最新代码）…");
@@ -374,7 +385,8 @@ async function main() {
   fs.rmSync(TEST_DB_PATH, { recursive: true, force: true });
   fs.mkdirSync(TEST_DB_PATH, { recursive: true });
 
-  ({ MongoMemoryServer: MongoMemoryServerClass } = require("mongodb-memory-server"));
+  ({ MongoMemoryReplSet: MongoMemoryReplSetClass } = require("mongodb-memory-server"));
+  ({ resetPortsCache } = require("mongodb-memory-server-core/lib/util/getport"));
 
   await startMongo();
   await startBackend();
@@ -410,6 +422,70 @@ async function main() {
     }
   } catch (error) {
     failures.push({ rule: "R13", desc: "重启验证执行异常", detail: error.message });
+  }
+
+  // R14：故障注入验证原子性 —— 扣款/预约/流水任一写入失败时全部不生效
+  console.log("== R14 故障注入：下单/取消/充值的原子性 ==");
+  rule("R14");
+  try {
+    const roomsNow = (await api("/rooms")).body;
+    const roomBailuNow = roomsNow.find((r) => r.name === "白鹭中包");
+    const memberF = (await api("/members", { method: "POST", body: { name: "故障会员F", phone: "13700000030", level: "NORMAL" } })).body;
+    await api(`/members/${memberF.id}/recharge`, { method: "POST", body: { amount: 500 } });
+    const baseBooking = await api("/bookings", {
+      method: "POST",
+      body: { roomId: roomBailuNow.id, memberId: memberF.id, startTime: futureTime(10, 10), endTime: futureTime(10, 12) },
+    });
+    check("故障注入前基准预约成功", baseBooking.status === 201, `实际状态码 ${baseBooking.status}`);
+    const f0 = (await api(`/members/${memberF.id}`)).body; // 余额 370.8，积分 129
+    const tx0 = (await api(`/members/${memberF.id}/transactions`)).body; // 1 充值 + 1 消费
+    check("基准状态：余额 370.8、积分 129、流水 2 条", nearlyEqual(f0.balance, 370.8) && f0.points === 129 && tx0.length === 2,
+      `实际余额 ${f0.balance} 积分 ${f0.points} 流水 ${tx0.length}`);
+
+    await stopBackend();
+    await startBackend({ FAULT_INJECT_BOOKING: "1", FAULT_INJECT_CANCEL: "1", FAULT_INJECT_RECHARGE: "1" });
+
+    const failRecharge = await api(`/members/${memberF.id}/recharge`, { method: "POST", body: { amount: 100 } });
+    check("注入故障下充值返回 500 与注入说明", failRecharge.status === 500 && failRecharge.body?.message?.includes("注入故障"),
+      `实际 ${failRecharge.status}：${failRecharge.body?.message ?? ""}`);
+    const fAfterRecharge = (await api(`/members/${memberF.id}`)).body;
+    check("充值故障后余额与累计充值不变", nearlyEqual(fAfterRecharge.balance, f0.balance) && fAfterRecharge.totalRecharged === 500,
+      `实际余额 ${fAfterRecharge.balance} 累计 ${fAfterRecharge.totalRecharged}`);
+
+    const failBooking = await api("/bookings", {
+      method: "POST",
+      body: { roomId: roomBailuNow.id, memberId: memberF.id, startTime: futureTime(11, 10), endTime: futureTime(11, 12) },
+    });
+    check("注入故障下下单返回 500 与注入说明", failBooking.status === 500 && failBooking.body?.message?.includes("注入故障"),
+      `实际 ${failBooking.status}：${failBooking.body?.message ?? ""}`);
+    const fAfterBooking = (await api(`/members/${memberF.id}`)).body;
+    check("下单故障后余额与积分不变（未扣款）", nearlyEqual(fAfterBooking.balance, f0.balance) && fAfterBooking.points === f0.points,
+      `实际余额 ${fAfterBooking.balance} 积分 ${fAfterBooking.points}`);
+    const fBookings = (await api("/bookings")).body.filter((b) => b.memberId === memberF.id);
+    check("下单故障后不产生预约记录", fBookings.length === 1, `实际 ${fBookings.length} 条`);
+
+    const failCancel = await api(`/bookings/${baseBooking.body.id}/cancel`, { method: "POST" });
+    check("注入故障下取消返回 500 与注入说明", failCancel.status === 500 && failCancel.body?.message?.includes("注入故障"),
+      `实际 ${failCancel.status}：${failCancel.body?.message ?? ""}`);
+    const bookingAfterCancel = (await api("/bookings")).body.find((b) => b.id === baseBooking.body.id);
+    check("取消故障后预约仍为已预约状态", bookingAfterCancel?.status === "booked", `实际 ${bookingAfterCancel?.status}`);
+    const fAfterCancel = (await api(`/members/${memberF.id}`)).body;
+    check("取消故障后余额不变（未退款）", nearlyEqual(fAfterCancel.balance, f0.balance), `实际余额 ${fAfterCancel.balance}`);
+
+    const txAfterFaults = (await api(`/members/${memberF.id}/transactions`)).body;
+    check("三次故障操作均不产生新流水", txAfterFaults.length === 2, `实际流水 ${txAfterFaults.length} 条`);
+
+    await stopBackend();
+    await startBackend();
+    const recoverRecharge = await api(`/members/${memberF.id}/recharge`, { method: "POST", body: { amount: 100 } });
+    check("恢复正常后充值成功生效", recoverRecharge.status === 200 && nearlyEqual(recoverRecharge.body.member.balance, f0.balance + 100),
+      `实际余额 ${recoverRecharge.body?.member?.balance}`);
+    const recoverCancel = await api(`/bookings/${baseBooking.body.id}/cancel`, { method: "POST" });
+    check("恢复正常后取消成功", recoverCancel.status === 200 && recoverCancel.body.status === "cancelled");
+    const fFinal = (await api(`/members/${memberF.id}`)).body;
+    check("恢复后退款到账（余额 600）", nearlyEqual(fFinal.balance, 600), `实际余额 ${fFinal.balance}`);
+  } catch (error) {
+    failures.push({ rule: "R14", desc: "故障注入验证执行异常", detail: error.message });
   }
 }
 

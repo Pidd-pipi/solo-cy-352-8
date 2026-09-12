@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import mongoose, { Types } from "mongoose";
 import { AppError } from "../../common/errors";
 import {
   getLevelRule,
@@ -84,30 +84,57 @@ export class MemberService {
     }
 
     const previousLevel = member.level;
-    member.balance = roundMoney(member.balance + amount);
-    member.totalRecharged = roundMoney(member.totalRecharged + amount);
-    const resolvedLevel = resolveLevelByTotalRecharged(member.totalRecharged);
-    // 等级只升不降
-    const order = ["NORMAL", "SILVER", "GOLD", "PLATINUM"];
-    if (order.indexOf(resolvedLevel) > order.indexOf(member.level)) {
-      member.level = resolvedLevel;
+    let upgradedLevel = previousLevel;
+    // 余额/等级变更与流水写入在同一事务中提交，全部成功或全部不生效。
+    // 会员文档在事务回调内重新加载：withTransaction 重试时回调会重放，
+    // 若在回调外加载并就地累加，重试会导致余额被重复累加。
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const freshMember = await MemberModel.findById(id).session(session);
+        if (!freshMember) {
+          throw new AppError(404, "会员不存在，可能已被删除");
+        }
+        freshMember.balance = roundMoney(freshMember.balance + amount);
+        freshMember.totalRecharged = roundMoney(freshMember.totalRecharged + amount);
+        const resolvedLevel = resolveLevelByTotalRecharged(freshMember.totalRecharged);
+        // 等级只升不降
+        const order = ["NORMAL", "SILVER", "GOLD", "PLATINUM"];
+        if (order.indexOf(resolvedLevel) > order.indexOf(freshMember.level)) {
+          freshMember.level = resolvedLevel;
+        }
+        await freshMember.save({ session });
+        upgradedLevel = freshMember.level;
+
+        await TransactionModel.create(
+          [
+            {
+              member: freshMember._id,
+              type: "recharge",
+              amount: roundMoney(amount),
+              balanceAfter: freshMember.balance,
+              pointsDelta: 0,
+              pointsAfter: freshMember.points,
+              note: `账户充值 ¥${roundMoney(amount).toFixed(2)}`,
+            },
+          ],
+          { session },
+        );
+
+        // 故障注入点（FAULT_INJECT_RECHARGE=1）：验证充值与流水整体回滚
+        if (process.env.FAULT_INJECT_RECHARGE === "1") {
+          throw new AppError(500, "注入故障：模拟充值事务提交前失败");
+        }
+      });
+    } finally {
+      await session.endSession();
     }
-    await member.save();
 
-    await TransactionModel.create({
-      member: member._id,
-      type: "recharge",
-      amount: roundMoney(amount),
-      balanceAfter: member.balance,
-      pointsDelta: 0,
-      pointsAfter: member.points,
-      note: `账户充值 ¥${roundMoney(amount).toFixed(2)}`,
-    });
-
-    const view = withLevelInfo(toMemberView(member));
+    const committed = await MemberModel.findById(id);
+    const view = withLevelInfo(toMemberView(committed!));
     return {
       member: view,
-      levelUpgraded: member.level !== previousLevel,
+      levelUpgraded: upgradedLevel !== previousLevel,
       levelName: view.levelName,
     };
   }

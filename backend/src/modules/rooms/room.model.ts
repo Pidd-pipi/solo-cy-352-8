@@ -9,6 +9,8 @@ export interface RoomDocument extends Document {
   hourlyRate: number;
   status: RoomStatus;
   description: string;
+  /** 下单事务内的每包厢写锁计数器（并发串行化用，无业务含义） */
+  bookingSeq: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -21,6 +23,7 @@ const roomSchema = new Schema<RoomDocument>(
     hourlyRate: { type: Number, required: true, min: 0 },
     status: { type: String, enum: ["available", "maintenance"], default: "available" },
     description: { type: String, default: "", maxlength: 200 },
+    bookingSeq: { type: Number, default: 0 },
   },
   { timestamps: true },
 );

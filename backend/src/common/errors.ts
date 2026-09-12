@@ -52,5 +52,9 @@ export function errorMiddleware(
     response.status(400).json({ message: "请求体不是有效的 JSON" });
     return;
   }
+  if (/Transaction numbers are only allowed|not a replica set|replica set/i.test(error.message)) {
+    response.status(503).json({ message: "数据库未以副本集模式运行，事务不可用，请检查数据库配置" });
+    return;
+  }
   response.status(500).json({ message: "服务器内部错误，请稍后重试" });
 }
