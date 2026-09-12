@@ -22,6 +22,8 @@ async function main() {
     binary: { version: "7.0.14" },
     instance: {
       port: PORT,
+      // 固定端口：端口被占用时直接报错，而不是静默改用随机端口（后端会连不上）
+      portGeneration: false,
       dbName: "app",
       storageEngine: "wiredTiger",
       dbPath: DB_PATH,

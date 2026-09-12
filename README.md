@@ -49,7 +49,7 @@ docker compose up -d
 | POST | `/bookings/quote` | 预约价格试算（时长 × 时价 × 等级折扣） |
 | POST | `/bookings/:id/cancel` | 取消预约并退款、回退积分 |
 
-本地功能检查（可选）：在无 Docker 的开发机上，可用 `backend/scripts/local-mongo.js` 启动一个数据落盘的本地 MongoDB（数据保存在项目根目录 `.mongo-data/`，目录不存在时会自动创建），再运行 `node backend/scripts/functional-check.js` 执行 55 项端到端检查。检查脚本每轮使用独立的会员与时段数据，可在同一数据库上重复执行。
+本地功能检查（可选）：在无 Docker 的开发机上，运行 `cd backend && npm test` 即可执行包厢预约与会员储值的业务规则测试套件（R1~R13，共 41 条断言）。套件自包含：自动构建后端，在独立数据目录 `.mongo-test-data/`（每轮清空，可重复执行）启动专用 MongoDB 与后端，覆盖折扣、余额、积分、时段重叠、重复取消、余额不足、非法时间、维护中包厢等规则，并分别重启后端与数据服务验证记录仍在；任何断言失败都会在报告中直接指出被破坏的规则编号与内容，并以非零码退出。开发时也可用 `backend/scripts/local-mongo.js` 单独启动一个数据落盘的本地 MongoDB（数据保存在项目根目录 `.mongo-data/`，目录不存在时自动创建）。
 
 ## 本地开发方式
 
