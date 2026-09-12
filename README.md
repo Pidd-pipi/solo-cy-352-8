@@ -49,7 +49,7 @@ docker compose up -d
 | POST | `/bookings/quote` | 预约价格试算（时长 × 时价 × 等级折扣） |
 | POST | `/bookings/:id/cancel` | 取消预约并退款、回退积分 |
 
-本地功能检查（可选）：在无 Docker 的开发机上，可用 `backend/scripts/local-mongo.js` 启动一个数据落盘的本地 MongoDB（数据保存在项目根目录 `.mongo-data/`），再运行 `node backend/scripts/functional-check.js` 执行 53 项端到端检查。
+本地功能检查（可选）：在无 Docker 的开发机上，可用 `backend/scripts/local-mongo.js` 启动一个数据落盘的本地 MongoDB（数据保存在项目根目录 `.mongo-data/`，目录不存在时会自动创建），再运行 `node backend/scripts/functional-check.js` 执行 55 项端到端检查。检查脚本每轮使用独立的会员与时段数据，可在同一数据库上重复执行。
 
 ## 本地开发方式
 
